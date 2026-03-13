@@ -1,107 +1,345 @@
+import argparse
+import glob
+import logging
+import os
+
 import cv2
+import numpy as np
+import timm
 import torch
 import torch.nn as nn
-import timm
-import numpy as np
-import torch.nn.functional as F
+import torch.optim as optim
 
 
 # ------------------ Backbone Definition ------------------
+logger = logging.getLogger(__name__)
+
+
 class Backbone(nn.Module):
-    """
-    Frozen backbone with double embeddings (512 channels).
-    Input:  [B, 3, H, W]
-    Output: [B, 512, H_out, W_out]
+    """Small wrapper around a timm backbone that returns spatial features.
+
+    By default the class does NOT apply a learned projection (visualization mode).
+    Set `use_projection=True` to add a 1x1 conv that maps channels to `out_channels`.
     """
 
-    def __init__(self, model_name="convnext_tiny", out_channels=512):
+    def __init__(
+        self,
+        model_name: str = "convnext_tiny",
+        out_channels: int = 512,
+        use_projection: bool = False,
+    ):
         super().__init__()
         self.backbone = timm.create_model(
             model_name,
             pretrained=True,
-            features_only=True,  # gives spatial feature maps
+            features_only=True,  # returns spatial feature maps
             out_indices=(3,),  # last stage
         )
         backbone_channels = self.backbone.feature_info.channels()[-1]
-        self.projection = nn.Conv2d(backbone_channels, out_channels, kernel_size=1)
+        if use_projection:
+            self.projection: nn.Module = nn.Conv2d(
+                backbone_channels, out_channels, kernel_size=1
+            )
+        else:
+            # For visualization we prefer to keep pretrained features intact
+            self.projection = nn.Identity()
 
-        # Freeze backbone
+        # Freeze backbone parameters by default (projection may remain trainable)
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.backbone(x)[0]  # [B, C, H, W]
-        features = self.projection(features)  # [B, out_channels, H, W]
-        return features
+        return self.projection(features)
 
 
 # ------------------ Setup ------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = Backbone().to(device).eval()
+def preprocess(frame: np.ndarray, size: tuple[int, int] = (224, 224)) -> torch.Tensor:
+    """Resize, convert BGR->RGB, scale and apply ImageNet normalization.
 
-# Use half precision on GPU if available
-if device.type == "cuda":
-    model = model.half()
-
-
-# Initialize camera
-cap = cv2.VideoCapture(0)
-
-
-# ------------------ Preprocessing ------------------
-def preprocess(frame):
-    frame_resized = cv2.resize(frame, (224, 224))
+    Returns a batched float32 tensor of shape [1, 3, H, W].
+    """
+    frame_resized = cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
     frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
     frame_norm = frame_rgb.astype(np.float32) / 255.0
     frame_chw = np.transpose(frame_norm, (2, 0, 1))  # HWC -> CHW
+
+    # ImageNet normalization
+    mean = np.array([0.485, 0.456, 0.406])[:, None, None]
+    std = np.array([0.229, 0.224, 0.225])[:, None, None]
+    frame_chw = (frame_chw - mean) / std
+
     tensor = torch.from_numpy(frame_chw).unsqueeze(0)
     return tensor
 
 
-# ------------------ Main Loop ------------------
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def train_projection_online(
+    model: Backbone,
+    device: torch.device,
+    steps: int = 200,
+    lr: float = 1e-3,
+    save_path: str = "projection_trained.pt",
+    camera_index: int = 0,
+):
+    """Train the model's 1x1 projection (online) with a reconstruction objective.
 
-    input_tensor = preprocess(frame).to(device)
+    This function builds a small decoder (1x1 conv) and trains projection+decoder to
+    reconstruct backbone features. The backbone itself remains frozen.
+    """
+    # Check projection availability
+    if not hasattr(model, "projection") or isinstance(model.projection, nn.Identity):
+        logger.error(
+            "Model projection is Identity or missing; enable --use-projection to train."
+        )
+        return
+
+    # Prepare model and decoder for training
+    # Ensure backbone stays frozen
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+
+    # Infer channel dims
+    try:
+        in_ch = model.backbone.feature_info.channels()[-1]
+    except Exception:
+        # fallback: inspect a forward pass
+        logger.debug(
+            "feature_info unavailable, running a dummy forward pass to infer channels"
+        )
+        dummy = torch.zeros(1, 3, 224, 224)
+        with torch.no_grad():
+            out = model.backbone(dummy)[0]
+        in_ch = out.shape[1]
+
+    out_ch = getattr(model.projection, "out_channels", None)
+    if out_ch is None:
+        # fallback if projection is wrapped or custom
+        out_ch = in_ch
+
+    decoder = nn.Conv2d(out_ch, in_ch, kernel_size=1).to(device)
+
+    # Put model/projection/decoder into float32 for stable training
+    model.float()
+    decoder.float()
+    model.train()
+    model.projection.train()
+
+    params = list(model.projection.parameters()) + list(decoder.parameters())
+    optimizer = optim.Adam(params, lr=lr)
+    criterion = nn.MSELoss()
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        logger.error("Could not open camera for training (index=%d)", camera_index)
+        return
+
+    try:
+        for step in range(steps):
+            # read frame (skip if not returned)
+            ret, frame = cap.read()
+            if not ret:
+                logger.debug("Empty frame while training; retrying")
+                continue
+
+            input_tensor = preprocess(frame).to(device).float()
+
+            # Extract backbone features as target (no grads)
+            with torch.no_grad():
+                target_feats = model.backbone(input_tensor)[0]
+
+            pred = model.projection(target_feats)
+            recon = decoder(pred)
+
+            loss = criterion(recon, target_feats)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if step % 10 == 0:
+                logger.info("[train] step %d/%d loss=%.6f", step, steps, float(loss))
+
+    except Exception:
+        logger.exception("Exception during projection training")
+    finally:
+        cap.release()
+        # Save projection state
+        try:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            torch.save(model.projection.state_dict(), save_path)
+            logger.info("Saved trained projection to %s", save_path)
+        except Exception:
+            logger.exception("Failed to save projection to %s", save_path)
+
+    # Return to eval mode and (optionally) half precision on CUDA
+    model.eval()
     if device.type == "cuda":
-        input_tensor = input_tensor.half()
+        model.half()
 
-    with torch.no_grad():
-        features = model(input_tensor)  # [1, 512, H_feat, W_feat]
 
-    # ------------------ Overlay Embedding ------------------
-    N_channels = 8
-    feature_map = features[0, :N_channels, :, :].mean(
-        dim=0, keepdim=True
-    )  # [1, H_feat, W_feat]
-    H_orig, W_orig = frame.shape[:2]
-    feature_map_up = F.interpolate(
-        feature_map.unsqueeze(0),
-        size=(H_orig, W_orig),
-        mode="bilinear",
-        align_corners=False,
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Camera embedding visualizer + optional projection trainer"
     )
-    feature_map_up = feature_map_up[0, 0].cpu().detach().numpy()
-    feature_map_up -= feature_map_up.min()
-    feature_map_up /= feature_map_up.max()
-    feature_map_up = (feature_map_up * 255).astype("uint8")
-    heatmap = cv2.applyColorMap(feature_map_up, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(frame, 0.6, heatmap, 0.4, 0)
+    parser.add_argument(
+        "--use-projection",
+        action="store_true",
+        help="Enable learned 1x1 projection (trainable)",
+    )
+    parser.add_argument(
+        "--projection-path",
+        type=str,
+        default=None,
+        help="Path to load projection state (pt file)",
+    )
+    parser.add_argument(
+        "--train-projection",
+        action="store_true",
+        help="Train the 1x1 projection using camera frames",
+    )
+    parser.add_argument(
+        "--projection-out-channels",
+        type=int,
+        default=512,
+        help="Number of output channels for the projection",
+    )
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=200,
+        help="Number of training steps when --train-projection is set",
+    )
+    parser.add_argument(
+        "--train-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for projection training",
+    )
+    parser.add_argument(
+        "--save-projection",
+        type=str,
+        default="projection_trained.pt",
+        help="File to save trained projection weights",
+    )
+    parser.add_argument(
+        "--camera-index", type=int, default=0, help="Camera index for cv2.VideoCapture"
+    )
+    args = parser.parse_args()
 
-    cv2.imshow("Camera Feed", frame)
-    cv2.imshow("Embedding Overlay", overlay)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
 
-    # ------------------ (Disabled) Save Embeddings ------------------
-    # Saving of extracted features has been disabled to avoid recording
-    # large artifact files. If you need to enable this temporarily, add
-    # an explicit flag or environment variable and handle storage outside
-    # of the repository.
+    # Build model according to CLI flags
+    model = Backbone(
+        out_channels=args.projection_out_channels, use_projection=args.use_projection
+    ).to(device)
+    model.eval()
+    if device.type == "cuda":
+        model.half()
 
-    # Exit on 'q' key
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+    # Load projection weights if requested
+    if args.projection_path:
+        try:
+            ckpt = torch.load(args.projection_path, map_location=device)
+            try:
+                # try loading whole checkpoint into model (partial load allowed)
+                model.load_state_dict(ckpt, strict=False)
+                logger.info("Loaded checkpoint into model (partial load allowed)")
+            except Exception:
+                # try loading projection-only state dict
+                try:
+                    if hasattr(model, "projection") and isinstance(
+                        model.projection, nn.Module
+                    ):
+                        model.projection.load_state_dict(ckpt)
+                        logger.info(
+                            "Loaded projection state dict from %s", args.projection_path
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to load projection weights from %s",
+                        args.projection_path,
+                    )
+        except Exception:
+            logger.exception(
+                "Could not read projection checkpoint: %s", args.projection_path
+            )
 
-cap.release()
-cv2.destroyAllWindows()
+    # Train projection if requested
+    if args.train_projection:
+        if not args.use_projection:
+            logger.error(
+                "--train-projection requires --use-projection. Exiting training step."
+            )
+        else:
+            train_projection_online(
+                model=model,
+                device=device,
+                steps=args.train_steps,
+                lr=args.train_lr,
+                save_path=args.save_projection,
+                camera_index=args.camera_index,
+            )
+
+    cap = cv2.VideoCapture(args.camera_index)
+    if not cap.isOpened():
+        logger.error(
+            "Could not open camera (cv2.VideoCapture(%d)). Exiting.", args.camera_index
+        )
+        return
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Camera returned empty frame — exiting loop.")
+                break
+
+            # Preprocess and move to device; keep dtype float32 then cast to half on CUDA
+            input_tensor = preprocess(frame).to(device)
+            if device.type == "cuda":
+                input_tensor = input_tensor.half()
+
+            with torch.no_grad():
+                features = model(input_tensor)  # [1, C, Hf, Wf]
+
+            # Ensure tensor shape
+            if isinstance(features, (list, tuple)):
+                feats = features[0]
+            else:
+                feats = features
+
+            # Aggregate activation energy across channels (L2) for a stable visualization
+            # feats[0] -> [C, Hf, Wf]
+            energy = feats[0].pow(2).sum(dim=0).sqrt().cpu().numpy()
+
+            # Stable per-frame normalization
+            energy -= float(energy.min())
+            energy_max = float(energy.max())
+            energy /= energy_max + 1e-6
+
+            H_orig, W_orig = frame.shape[:2]
+            energy_uint8 = (energy * 255).astype(np.uint8)
+            # Upsample to original frame size and apply light smoothing
+            energy_up = cv2.resize(
+                energy_uint8, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR
+            )
+            energy_up = cv2.GaussianBlur(energy_up, (7, 7), 0)
+
+            heatmap = cv2.applyColorMap(energy_up, cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(frame, 0.6, heatmap, 0.4, 0)
+
+            cv2.imshow("Camera Feed", frame)
+            cv2.imshow("Embedding Overlay", overlay)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
