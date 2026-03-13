@@ -1,5 +1,4 @@
 import argparse
-import glob
 import logging
 import os
 
@@ -224,14 +223,66 @@ def main() -> None:
     parser.add_argument(
         "--camera-index", type=int, default=0, help="Camera index for cv2.VideoCapture"
     )
+
+    # Preset/model selection
+    parser.add_argument(
+        "--preset",
+        choices=["lite", "mid", "high"],
+        default="mid",
+        help="Model preset: lite->convnext_small, mid->swin_small, high->vit_base",
+    )
+    parser.add_argument(
+        "-l",
+        "--lite",
+        action="store_true",
+        help="Shorthand: set preset=lite (convnext_small)",
+    )
+    parser.add_argument(
+        "-s",
+        "--semantic",
+        choices=["none", "clip", "dino"],
+        default="none",
+        help="Use semantic model pipelines (clip/dino) instead of preset",
+    )
+    parser.add_argument(
+        "-m",
+        "--model-name",
+        type=str,
+        default=None,
+        help="Explicit timm/model name override (wins over preset)",
+    )
     args = parser.parse_args()
+
+    # handle shorthand -l
+    if args.lite:
+        args.preset = "lite"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
     # Build model according to CLI flags
+    model_name = None
+    if args.model_name:
+        model_name = args.model_name
+    else:
+        preset_map = {
+            "lite": "convnext_small",
+            "mid": "swin_small_patch4_window7_224",
+            "high": "vit_base_patch16_224",
+        }
+        model_name = preset_map.get(args.preset, "swin_small_patch4_window7_224")
+
+    # If semantic option is set, handle separately (semantic pipelines may override model)
+    if args.semantic != "none":
+        # Placeholder: for now, semantic pipelines handled later or use explicit model_name
+        logger.info(
+            "Semantic mode set to %s; attempting to load semantic model", args.semantic
+        )
+
     model = Backbone(
-        out_channels=args.projection_out_channels, use_projection=args.use_projection
+        out_channels=args.projection_out_channels,
+        use_projection=args.use_projection,
+        model_name=model_name,
     ).to(device)
     model.eval()
     if device.type == "cuda":
