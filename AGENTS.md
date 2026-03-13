@@ -35,6 +35,14 @@ Run (development)
   - main.py currently creates the model and opens the camera at import-time. Avoid importing `main.py` in unit tests.
 - Headless/CI: avoid running `main.py` in CI. For experiments that require GUI, wrap with `xvfb-run -a python main.py` in Linux CI.
 
+Model presets
+- Quality flag: `-q/--quality {lite,mid,high}` — default `mid`.
+  - lite → `convnext_small` (low-latency convnext small)
+  - mid  → `swin_small_patch4_window7_224` (Swin small)
+  - high → `vit_base_patch16_224` (ViT base)
+  - Override: `-m/--model-name <timm-name>` wins over `--quality` if provided.
+  - Semantic models: `-s/--semantic {none,clip,dino}` (optional semantic pipeline override).
+
 Tests
 - Test runner: `pytest` (recommended).
 - Install test deps: `python -m pip install pytest pytest-mock`

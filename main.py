@@ -226,16 +226,11 @@ def main() -> None:
 
     # Preset/model selection
     parser.add_argument(
-        "--preset",
+        "-q",
+        "--quality",
         choices=["lite", "mid", "high"],
         default="mid",
-        help="Model preset: lite->convnext_small, mid->swin_small, high->vit_base",
-    )
-    parser.add_argument(
-        "-l",
-        "--lite",
-        action="store_true",
-        help="Shorthand: set preset=lite (convnext_small)",
+        help="Model quality preset: lite->convnext_small, mid->swin_small, high->vit_base",
     )
     parser.add_argument(
         "-s",
@@ -249,40 +244,33 @@ def main() -> None:
         "--model-name",
         type=str,
         default=None,
-        help="Explicit timm/model name override (wins over preset)",
+        help="Explicit timm/model name override (wins over quality preset)",
     )
     args = parser.parse_args()
-
-    # handle shorthand -l
-    if args.lite:
-        args.preset = "lite"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    # Build model according to CLI flags
-    model_name = None
-    if args.model_name:
-        model_name = args.model_name
-    else:
-        preset_map = {
-            "lite": "convnext_small",
-            "mid": "swin_small_patch4_window7_224",
-            "high": "vit_base_patch16_224",
-        }
-        model_name = preset_map.get(args.preset, "swin_small_patch4_window7_224")
+    # Resolve model name from quality preset unless explicit model-name is provided
+    preset_map = {
+        "lite": "convnext_small",
+        "mid": "swin_small_patch4_window7_224",
+        "high": "vit_base_patch16_224",
+    }
+    resolved_model = args.model_name or preset_map.get(
+        args.quality, "swin_small_patch4_window7_224"
+    )
 
-    # If semantic option is set, handle separately (semantic pipelines may override model)
     if args.semantic != "none":
-        # Placeholder: for now, semantic pipelines handled later or use explicit model_name
         logger.info(
-            "Semantic mode set to %s; attempting to load semantic model", args.semantic
+            "Semantic mode set to %s; semantic pipelines will be used if implemented",
+            args.semantic,
         )
 
     model = Backbone(
+        model_name=resolved_model,
         out_channels=args.projection_out_channels,
         use_projection=args.use_projection,
-        model_name=model_name,
     ).to(device)
     model.eval()
     if device.type == "cuda":
