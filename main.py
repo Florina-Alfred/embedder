@@ -340,7 +340,7 @@ def main() -> None:
                 input_tensor = input_tensor.half()
 
             with torch.no_grad():
-                features = model(input_tensor)  # [1, C, Hf, Wf]
+                features = model(input_tensor)  # could be tensor or list/tuple
 
             # Ensure tensor shape
             if isinstance(features, (list, tuple)):
@@ -348,14 +348,42 @@ def main() -> None:
             else:
                 feats = features
 
-            # Aggregate activation energy across channels (L2) for a stable visualization
-            # feats[0] -> [C, Hf, Wf]
-            energy = feats[0].pow(2).sum(dim=0).sqrt().cpu().numpy()
+            # If model returned token embeddings (e.g. ViT: [B, N+1, D]), reshape to [B, D, Hf, Wf]
+            if feats.dim() == 3:
+                b, n, d = feats.shape
+                # Heuristic: tokens format [B, N+1, D] where N is num patches
+                if n > d:
+                    # assume tokens, drop cls token if present
+                    patches = feats[:, 1:, :] if n > 1 else feats
+                    N = patches.shape[1]
+                    h = int(round(N**0.5))
+                    if h * h == N:
+                        feats = patches.transpose(1, 2).reshape(b, d, h, h)
+                        logger.debug("Reshaped ViT tokens to spatial %s", feats.shape)
+                    else:
+                        # fallback: treat channel dim as d and collapse to single map
+                        feats = feats.transpose(1, 2).reshape(b, d, 1, N)
+                        logger.debug("Fallback reshape of tokens to %s", feats.shape)
 
-            # Stable per-frame normalization
-            energy -= float(energy.min())
-            energy_max = float(energy.max())
-            energy /= energy_max + 1e-6
+            # Convert to float for stable CPU ops
+            feats = feats.float()
+
+            # Aggregate activation energy across channels (sum(abs)) for a stable visualization
+            energy = feats[0].abs().sum(dim=0).cpu().numpy()
+
+            # Percentile-based clipping to reduce outlier effects
+            vmin = float(np.percentile(energy, 1.0))
+            vmax = float(np.percentile(energy, 99.0))
+            if vmax - vmin < 1e-6:
+                # fallback to global running max to avoid flat maps
+                if not hasattr(main, "_energy_ema"):
+                    main._energy_ema = vmax
+                main._energy_ema = max(main._energy_ema * 0.99, vmax)
+                scale = main._energy_ema + 1e-6
+                energy = energy / scale
+            else:
+                energy = np.clip(energy, vmin, vmax)
+                energy = (energy - vmin) / (vmax - vmin + 1e-6)
 
             H_orig, W_orig = frame.shape[:2]
             energy_uint8 = (energy * 255).astype(np.uint8)
@@ -363,7 +391,13 @@ def main() -> None:
             energy_up = cv2.resize(
                 energy_uint8, (W_orig, H_orig), interpolation=cv2.INTER_LINEAR
             )
-            energy_up = cv2.GaussianBlur(energy_up, (7, 7), 0)
+            # apply small bilateral filter to preserve edges while smoothing
+            try:
+                energy_up = cv2.bilateralFilter(
+                    energy_up, d=9, sigmaColor=75, sigmaSpace=75
+                )
+            except Exception:
+                energy_up = cv2.GaussianBlur(energy_up, (7, 7), 0)
 
             heatmap = cv2.applyColorMap(energy_up, cv2.COLORMAP_JET)
             overlay = cv2.addWeighted(frame, 0.6, heatmap, 0.4, 0)
